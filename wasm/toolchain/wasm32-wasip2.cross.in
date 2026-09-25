@@ -1,0 +1,57 @@
+# Meson cross file for building Postgres as a wasm32-wasip2 component for the
+# pgzero host. The Makefile substitutes @ROOT@ to produce build/wasm32-wasip2.cross.
+
+[constants]
+sdk = '@ROOT@/.tools/wasi-sdk'
+# setjmp/longjmp through the standard exception-handling proposal; real
+# atomics for spinlocks in shared memory.
+codegen = ['-mllvm', '-wasm-enable-sjlj', '-mllvm', '-wasm-use-legacy-eh=false',
+           '-matomics', '-mbulk-memory']
+# wasm/libpgzero/include wraps libc headers to add what pgzero's libc extensions supply.
+cppflags = ['-isystem', '@ROOT@/wasm/libpgzero/include',
+            '-D_WASI_EMULATED_MMAN', '-D_WASI_EMULATED_PROCESS_CLOCKS',
+            '-D_WASI_EMULATED_GETPID']
+
+# Route descriptor and socket calls through libpgzero (see wasm/libpgzero/src/fd.c).
+wrap_args = [
+    '-Wl,--wrap=read', '-Wl,--wrap=readv', '-Wl,--wrap=write', '-Wl,--wrap=writev',
+    '-Wl,--wrap=close', '-Wl,--wrap=fcntl', '-Wl,--wrap=dup', '-Wl,--wrap=dup2',
+    '-Wl,--wrap=pipe', '-Wl,--wrap=pipe2', '-Wl,--wrap=poll', '-Wl,--wrap=nanosleep',
+    '-Wl,--wrap=_Exit', '-Wl,--wrap=_exit', '-Wl,--wrap=socket', '-Wl,--wrap=bind', '-Wl,--wrap=listen',
+    '-Wl,--wrap=accept', '-Wl,--wrap=accept4', '-Wl,--wrap=connect', '-Wl,--wrap=recv',
+    '-Wl,--wrap=send', '-Wl,--wrap=shutdown', '-Wl,--wrap=getsockopt', '-Wl,--wrap=setsockopt',
+    '-Wl,--wrap=getsockname', '-Wl,--wrap=getpeername', '-Wl,--wrap=getaddrinfo', '-Wl,--wrap=freeaddrinfo',
+    '-Wl,--wrap=getnameinfo', '-Wl,--wrap=dlopen', '-Wl,--wrap=dlsym', '-Wl,--wrap=dlclose',
+    '-Wl,--wrap=dlerror', '-Wl,--wrap=realpath', '-Wl,--wrap=stat', '-Wl,--wrap=lstat',
+    '-Wl,--wrap=fstat', '-Wl,--wrap=fstatat', '-Wl,--wrap=chmod', '-Wl,--wrap=fchmod',
+    '-Wl,--wrap=mmap', '-Wl,--wrap=munmap', '-Wl,--wrap=ftruncate', '-Wl,--wrap=pwritev',
+    '-Wl,--wrap=preadv', '-Wl,--wrap=access', '-Wl,--wrap=faccessat',
+    ]
+
+[binaries]
+c = '@ROOT@/wasm/toolchain/clang'
+# Link core modules with wasm-ld (meson cannot drive wasm-component-ld);
+# the Makefile turns the result into a component with wasm-tools.
+c_ld = 'lld'
+ar = sdk + '/bin/llvm-ar'
+ranlib = sdk + '/bin/llvm-ranlib'
+strip = sdk + '/bin/llvm-strip'
+nm = sdk + '/bin/llvm-nm'
+
+[built-in options]
+c_args = codegen + cppflags
+# libpgzero supplies the POSIX pieces wasi-libc lacks. Postgres needs a real
+# C stack (max_stack_depth defaults to 2MB), and the linear memory may grow
+# to the full 4GiB.
+c_link_args = codegen + ['@ROOT@/build/libpgzero/libpgzero.a'] + wrap_args + [
+    '-Wl,-z,stack-size=8388608', '-Wl,--max-memory=4294967296',
+    '-lsetjmp', '-lwasi-emulated-mman', '-lwasi-emulated-process-clocks']
+
+[properties]
+needs_exe_wrapper = true
+
+[host_machine]
+system = 'wasi'
+cpu_family = 'wasm32'
+cpu = 'wasm32'
+endian = 'little'

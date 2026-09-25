@@ -1,0 +1,152 @@
+package pgzero:host@0.1.0;
+
+// The pgzero "kernel": everything a Postgres process needs that WASI does not
+// provide. The guest side lives in wasm/libpgzero/src (libpgzero), which implements
+// the POSIX functions Postgres calls on top of these imports.
+//
+// Conventions:
+//   - Every function that can fail returns s32: >= 0 on success, or a
+//     negated wasi-libc errno value.
+//   - Pointer-typed parameters (u32 named *-addr or buf) are addresses in
+//     the caller's linear memory. The host reads and writes them directly,
+//     using wasi-libc's struct layouts. This keeps hot paths free of
+//     canonical-ABI copies.
+//   - Functions that block return -EINTR when a signal that is neither
+//     blocked nor ignored becomes pending (see sig).
+
+/// Processes. Each process is a separate instance of the same component.
+interface proc {
+    getpid: func() -> s32;
+    getppid: func() -> s32;
+
+    /// Start a new process running the program named by argv[0]'s base
+    /// name. argv-addr and envp-addr point at NULL-terminated char*[]
+    /// arrays; cwd-addr is the child's working directory (a C string). The
+    /// child inherits the caller's host file descriptors (except
+    /// close-on-exec ones), like fork+exec. Returns the child's pid.
+    spawn: func(argv-addr: u32, envp-addr: u32, cwd-addr: u32) -> s32;
+
+    /// waitpid(2). pid -1 waits for any child. options: WNOHANG = 1.
+    /// On success writes the wait status to status-addr (if non-zero) and
+    /// returns the pid, or 0 with WNOHANG and nothing to reap.
+    waitpid: func(pid: s32, status-addr: u32, options: s32) -> s32;
+
+    /// kill(2). sig 0 checks for existence.
+    kill: func(pid: s32, sig: s32) -> s32;
+
+    /// Terminate the calling process. status is a wait(2)-style status:
+    /// (code << 8) for a normal exit, or the signal number for a death by
+    /// signal. Does not return.
+    exit: func(status: s32);
+}
+
+/// Signals. Each process owns a signal control block in its own memory:
+///
+///   struct { u64 pending; u64 blocked; u64 ignored; }   (8-byte aligned)
+///
+/// Bit (1 << signo) represents signo. The host atomically ORs bits into
+/// `pending`; the guest clears them when it dispatches handlers, and keeps
+/// `blocked` / `ignored` current so the host knows which signals should
+/// interrupt a blocking call.
+interface sig {
+    /// Register the control block. Called once at process start.
+    register: func(block-addr: u32) -> s32;
+
+    /// setitimer(ITIMER_REAL): deliver SIGALRM after value-usec, then every
+    /// interval-usec (0 = one shot). value-usec 0 disarms. Returns the usec
+    /// remaining on the previous timer.
+    set-alarm: func(value-usec: u64, interval-usec: u64) -> s64;
+
+    /// Sleep for usec (u64::MAX = forever). Returns 0, or -EINTR if a
+    /// signal interrupted the sleep.
+    sleep: func(usec: u64) -> s32;
+}
+
+/// Host-owned file descriptors: pipes and sockets. They are numbered from
+/// FD-BASE (1 << 20) so they never collide with wasi-libc's descriptors.
+interface fd {
+    /// Open a descriptor like /dev/null: reads return end of file and
+    /// writes are discarded.
+    devnull: func() -> s32;
+    /// pipe2(2). Writes two fds to fds-addr.
+    pipe: func(fds-addr: u32, %flags: s32) -> s32;
+    read: func(fd: s32, buf: u32, len: u32) -> s32;
+    write: func(fd: s32, buf: u32, len: u32) -> s32;
+    close: func(fd: s32) -> s32;
+    /// dup(2) (new-fd -1) or dup2(2).
+    dup: func(fd: s32, new-fd: s32) -> s32;
+    /// fcntl(2): F_GETFD, F_SETFD, F_GETFL, F_SETFL.
+    fcntl: func(fd: s32, cmd: s32, arg: s32) -> s32;
+    /// poll(2) over a struct pollfd array. Every fd must be a host fd.
+    /// timeout-ms -1 waits forever.
+    poll: func(fds-addr: u32, nfds: u32, timeout-ms: s32) -> s32;
+}
+
+/// Sockets (host fds). AF_INET, AF_INET6 and AF_UNIX stream sockets.
+interface net {
+    socket: func(domain: s32, socktype: s32, protocol: s32) -> s32;
+    bind: func(fd: s32, addr: u32, addrlen: u32) -> s32;
+    listen: func(fd: s32, backlog: s32) -> s32;
+    /// addr/addrlen-addr may be 0.
+    accept: func(fd: s32, addr: u32, addrlen-addr: u32, %flags: s32) -> s32;
+    connect: func(fd: s32, addr: u32, addrlen: u32) -> s32;
+    recv: func(fd: s32, buf: u32, len: u32, %flags: s32) -> s32;
+    send: func(fd: s32, buf: u32, len: u32, %flags: s32) -> s32;
+    shutdown: func(fd: s32, how: s32) -> s32;
+    getsockopt: func(fd: s32, level: s32, name: s32, val: u32, len-addr: u32) -> s32;
+    setsockopt: func(fd: s32, level: s32, name: s32, val: u32, len: u32) -> s32;
+    getsockname: func(fd: s32, addr: u32, addrlen-addr: u32) -> s32;
+    getpeername: func(fd: s32, addr: u32, addrlen-addr: u32) -> s32;
+}
+
+/// Shared memory segments, mapped into the caller's linear memory.
+interface shm {
+    /// Create a segment of size bytes. Returns its id.
+    create: func(size: u32) -> s32;
+    /// Size of segment id, or -ENOENT.
+    size: func(id: s32) -> s32;
+    /// Map segment id at addr (64KiB aligned, within the current memory
+    /// size). The mapping lasts for the life of the process.
+    attach: func(id: s32, addr: u32) -> s32;
+    /// Remove segment id once no process has it attached.
+    remove: func(id: s32) -> s32;
+
+    // POSIX shared memory objects (shm_open), as host descriptors.
+
+    /// shm_open(3): open or create the named object; flags are wasi-libc
+    /// O_CREAT / O_EXCL / O_TRUNC. Returns a host fd.
+    open: func(name-addr: u32, name-len: u32, %flags: s32) -> s32;
+    /// shm_unlink(3).
+    unlink: func(name-addr: u32, name-len: u32) -> s32;
+    /// ftruncate(2) on a shm fd. An object can be sized once.
+    truncate: func(fd: s32, size: u32) -> s32;
+    /// Size of the object behind fd, or -EINVAL if fd is not a shm fd.
+    fd-size: func(fd: s32) -> s32;
+    /// Map len bytes (64KiB aligned) of the object behind fd at addr, a
+    /// 64KiB-aligned range within the caller's memory.
+    map-fd: func(fd: s32, addr: u32, len: u32) -> s32;
+    /// Replace a mapping made with map-fd or attach by private zeroed
+    /// memory again.
+    unmap: func(addr: u32, len: u32) -> s32;
+}
+
+/// Counting semaphores shared by all processes.
+interface sema {
+    create: func(initial: s32) -> s32;
+    /// Block until the count is positive, then decrement. May return
+    /// -EINTR.
+    lock: func(id: s32) -> s32;
+    /// Returns 0 if decremented, -EAGAIN if the count was zero.
+    try-lock: func(id: s32) -> s32;
+    unlock: func(id: s32) -> s32;
+    reset: func(id: s32) -> s32;
+}
+
+world guest {
+    import proc;
+    import sig;
+    import fd;
+    import net;
+    import shm;
+    import sema;
+}

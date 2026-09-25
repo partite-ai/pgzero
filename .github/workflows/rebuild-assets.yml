@@ -1,0 +1,71 @@
+# Rebuilds the WebAssembly Postgres that the library embeds
+# (internal/assets), tests it, and opens a pull request with the result.
+#
+# Run it by hand from the Actions tab, on the branch to rebuild; nothing
+# triggers it automatically. Opening the pull request needs "Allow GitHub
+# Actions to create and approve pull requests" in the repository's
+# Settings > Actions > General.
+name: Rebuild wasm assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build bison flex perl python3 gcc make curl
+
+      - name: Fetch toolchain (wasi-sdk, wasm-tools)
+        run: make tools
+
+      - name: Build Postgres and regenerate internal/assets
+        run: make assets
+
+      - name: Library tests
+        run: make test
+
+      - name: Postgres regression suite
+        run: make regress
+
+      - name: pgvector regression suite
+        run: make regress-pgvector
+
+      - name: Upload logs and regression output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/pg-build.log
+            build/regress/out/
+            build/regress/server.log
+          if-no-files-found: ignore
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          add-paths: internal/assets
+          branch: rebuild-assets/${{ github.ref_name }}
+          commit-message: Rebuild wasm assets
+          title: Rebuild wasm assets
+          body: |
+            Rebuilt by the [Rebuild wasm assets](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow from `${{ github.sha }}`.
+
+            The library tests and the Postgres and pgvector regression suites passed against this build.
+          delete-branch: true

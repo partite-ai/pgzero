@@ -1,0 +1,774 @@
+diff --git a/meson.build b/meson.build
+index 707b222..44509ee 100644
+--- a/meson.build
++++ b/meson.build
+@@ -42,7 +42,13 @@ host_cpu = host_machine.cpu_family()
+ cc = meson.get_compiler('c')
+ 
+ not_found_dep = dependency('', required: false)
+-thread_dep = dependency('threads')
++# pgzero: wasm32-wasip2 has no threads; wasi-libc's single-threaded pthread
++# stubs need no flags, and -pthread would force a shared linear memory.
++if host_system == 'wasi'
++  thread_dep = declare_dependency()
++else
++  thread_dep = dependency('threads')
++endif
+ auto_features = get_option('auto_features')
+ 
+ 
+@@ -320,6 +326,13 @@ elif host_system == 'windows'
+ 
+   windows = import('windows')
+ 
++elif host_system == 'wasi'
++  # pgzero: a wasm32-wasip2 component run by the pgzero Go host, which supplies
++  # process management, shared memory and semaphores through host calls.
++  shmem_kind = 'wasm'
++  sema_kind = 'wasm'
++  cppflags += '-D_GNU_SOURCE'
++
+ else
+   # XXX: Should we add an option to override the host_system as an escape
+   # hatch?
+diff --git a/src/backend/commands/collationcmds.c b/src/backend/commands/collationcmds.c
+index 8acbfbb..4c1ac6a 100644
+--- a/src/backend/commands/collationcmds.c
++++ b/src/backend/commands/collationcmds.c
+@@ -575,7 +575,8 @@ pg_collation_actual_version(PG_FUNCTION_ARGS)
+ 
+ 
+ /* will we use "locale -a" in pg_import_system_collations? */
+-#if !defined(WIN32)
++/* (pgzero: wasi-libc only knows the C and POSIX locales; there is no "locale".) */
++#if !defined(WIN32) && !defined(__wasi__)
+ #define READ_LOCALE_A_OUTPUT
+ #endif
+ 
+diff --git a/src/backend/meson.build b/src/backend/meson.build
+index 2b0db21..be0cae2 100644
+--- a/src/backend/meson.build
++++ b/src/backend/meson.build
+@@ -132,8 +132,11 @@ postgres = executable('postgres',
+   link_args: backend_link_args,
+   link_with: backend_link_with,
+   link_depends: backend_link_depends,
+-  export_dynamic: true,
+-  implib: 'postgres',
++  # pgzero: nothing is loaded dynamically on wasi, and exporting everything
++  # would also export the setjmp/longjmp exception tag. (implib implies
++  # export_dynamic.)
++  export_dynamic: host_system != 'wasi',
++  implib: host_system != 'wasi' ? 'postgres' : false,
+   dependencies: backend_build_deps,
+   kwargs: default_bin_args,
+ )
+diff --git a/src/backend/port/meson.build b/src/backend/port/meson.build
+index 09d54e0..452f331 100644
+--- a/src/backend/port/meson.build
++++ b/src/backend/port/meson.build
+@@ -25,6 +25,14 @@ if cdata.has('USE_WIN32_SHARED_MEMORY')
+   backend_sources += files('win32_shmem.c')
+ endif
+ 
++if cdata.has('USE_WASM_SEMAPHORES')
++  backend_sources += files('wasm_sema.c')
++endif
++
++if cdata.has('USE_WASM_SHARED_MEMORY')
++  backend_sources += files('wasm_shmem.c')
++endif
++
+ if host_system == 'windows'
+   subdir('win32')
+ endif
+diff --git a/src/backend/port/wasm_sema.c b/src/backend/port/wasm_sema.c
+new file mode 100644
+index 0000000..2b841e1
+--- /dev/null
++++ b/src/backend/port/wasm_sema.c
+@@ -0,0 +1,104 @@
++/*-------------------------------------------------------------------------
++ *
++ * wasm_sema.c
++ *	  Semaphores for the pgzero wasm port.
++ *
++ * The pgzero host keeps counting semaphores shared by all processes. A
++ * PGSemaphore in shared memory just records the host's id, so any process
++ * can use it.
++ *
++ * src/backend/port/wasm_sema.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include "pgzero.h"
++#include "storage/ipc.h"
++#include "storage/pg_sema.h"
++#include "storage/shmem.h"
++
++typedef struct PGSemaphoreData
++{
++	int			id;
++} PGSemaphoreData;
++
++static PGSemaphoreData *sharedSemas;	/* array in shared memory */
++static int	numSems;
++static int	maxSems;
++
++Size
++PGSemaphoreShmemSize(int maxSemas)
++{
++	return mul_size(maxSemas, sizeof(PGSemaphoreData));
++}
++
++void
++PGReserveSemaphores(int maxSemas)
++{
++	sharedSemas = (PGSemaphoreData *)
++		ShmemAllocUnlocked(PGSemaphoreShmemSize(maxSemas));
++	numSems = 0;
++	maxSems = maxSemas;
++}
++
++PGSemaphore
++PGSemaphoreCreate(void)
++{
++	PGSemaphore sema;
++
++	/* Can't do this in a backend, because static state is postmaster's */
++	Assert(!IsUnderPostmaster);
++
++	if (numSems >= maxSems)
++		elog(PANIC, "too many semaphores created");
++	sema = &sharedSemas[numSems];
++	sema->id = pgzero_sema_create(1);
++	if (sema->id < 0)
++		elog(PANIC, "could not create semaphore: %m");
++	numSems++;
++	return sema;
++}
++
++void
++PGSemaphoreReset(PGSemaphore sema)
++{
++	if (pgzero_sema_reset(sema->id) < 0)
++		elog(FATAL, "could not reset semaphore: %m");
++}
++
++void
++PGSemaphoreLock(PGSemaphore sema)
++{
++	int			rc;
++
++	/*
++	 * As in posix_sema.c: retry if interrupted by a signal. Handlers only
++	 * set flags and latches, so it is safe to go back to sleep.
++	 */
++	do
++	{
++		rc = pgzero_sema_lock(sema->id);
++	} while (rc < 0 && errno == EINTR);
++
++	if (rc < 0)
++		elog(FATAL, "could not lock semaphore: %m");
++}
++
++void
++PGSemaphoreUnlock(PGSemaphore sema)
++{
++	if (pgzero_sema_unlock(sema->id) < 0)
++		elog(FATAL, "could not unlock semaphore: %m");
++}
++
++bool
++PGSemaphoreTryLock(PGSemaphore sema)
++{
++	if (pgzero_sema_try_lock(sema->id) == 0)
++		return true;
++	if (errno == EAGAIN)
++		return false;
++	elog(FATAL, "could not lock semaphore: %m");
++	return false;
++}
+diff --git a/src/backend/port/wasm_shmem.c b/src/backend/port/wasm_shmem.c
+new file mode 100644
+index 0000000..527b1ea
+--- /dev/null
++++ b/src/backend/port/wasm_shmem.c
+@@ -0,0 +1,207 @@
++/*-------------------------------------------------------------------------
++ *
++ * wasm_shmem.c
++ *	  Shared memory for the pgzero wasm port.
++ *
++ * Each Postgres process is a separate wasm instance with its own linear
++ * memory. The pgzero host maps a shared segment over a fixed window of that
++ * memory, at the same address in every process, which is exactly what
++ * EXEC_BACKEND needs: children re-attach at the address the postmaster
++ * recorded.
++ *
++ * The window starts at PGZERO_SHM_BASE. Linear memory grows only upwards, so
++ * a process must attach before its heap has grown past the window; the
++ * postmaster and its children attach early in startup, well before that.
++ * Memory between the heap and the window is reserved address space that is
++ * never touched.
++ *
++ * src/backend/port/wasm_shmem.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <unistd.h>
++
++#include "pgzero.h"
++#include "miscadmin.h"
++#include "storage/dsm.h"
++#include "storage/ipc.h"
++#include "storage/pg_shmem.h"
++#include "utils/guc.h"
++#include "utils/guc_hooks.h"
++
++#define WASM_PAGE_SIZE	65536
++#define PGZERO_SHM_BASE	((uintptr_t) 512 * 1024 * 1024)
++
++unsigned long UsedShmemSegID = 0;
++void	   *UsedShmemSegAddr = NULL;
++
++/* End of the window this process has mapped so far (0 if none). */
++static uintptr_t mapped_end = 0;
++
++/*
++ * Map shared segment id, of the given size, at PGZERO_SHM_BASE.
++ */
++static void *
++map_segment(int id, Size size)
++{
++	uintptr_t	end = TYPEALIGN(WASM_PAGE_SIZE, PGZERO_SHM_BASE + size);
++	uintptr_t	cur = (uintptr_t) __builtin_wasm_memory_size(0) * WASM_PAGE_SIZE;
++
++	if (end < PGZERO_SHM_BASE)
++		elog(FATAL, "shared memory segment of %zu bytes is too large", size);
++
++	if (cur > PGZERO_SHM_BASE)
++	{
++		/*
++		 * Only acceptable if the window is already ours, e.g. when the
++		 * postmaster re-creates shared memory after a crash.
++		 */
++		if (mapped_end == 0 || end > mapped_end)
++			elog(FATAL, "cannot map shared memory: the process heap already extends past %p",
++				 (void *) PGZERO_SHM_BASE);
++	}
++	else if (__builtin_wasm_memory_grow(0, (end - cur) / WASM_PAGE_SIZE) < 0)
++		elog(FATAL, "could not reserve %zu bytes of address space for shared memory",
++			 (size_t) (end - cur));
++
++	if (pgzero_shm_attach(id, (void *) PGZERO_SHM_BASE) < 0)
++		elog(FATAL, "could not attach to shared memory segment %d: %m", id);
++
++	if (end > mapped_end)
++		mapped_end = end;
++	return (void *) PGZERO_SHM_BASE;
++}
++
++static void
++shmem_delete(int status, Datum arg)
++{
++	(void) pgzero_shm_remove(DatumGetInt32(arg));
++}
++
++PGShmemHeader *
++PGSharedMemoryCreate(Size size, PGShmemHeader **shim)
++{
++	PGShmemHeader *hdr;
++	int			id;
++
++	Assert(size > MAXALIGN(sizeof(PGShmemHeader)));
++
++	if (huge_pages == HUGE_PAGES_ON)
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("huge pages not supported on this platform")));
++
++	if (size > (Size) PG_INT32_MAX)
++		ereport(FATAL,
++				(errmsg("could not create shared memory segment: size %zu is too large", size)));
++
++	id = pgzero_shm_create(size);
++	if (id < 0)
++		ereport(FATAL,
++				(errmsg("could not create shared memory segment: %m"),
++				 errdetail("Failed system call was pgzero_shm_create(size=%zu).", size)));
++	on_shmem_exit(shmem_delete, Int32GetDatum(id));
++
++	hdr = (PGShmemHeader *) map_segment(id, size);
++
++	/*
++	 * Mark the segment as created by this process. The order of
++	 * assignments matters, so that another process can't see the header as
++	 * valid but belonging to an invalid PID.
++	 */
++	hdr->creatorPID = getpid();
++	hdr->magic = PGShmemMagic;
++	hdr->totalsize = size;
++	hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
++	hdr->dsm_control = 0;
++	hdr->device = 0;
++	hdr->inode = 0;
++
++	UsedShmemSegAddr = hdr;
++	UsedShmemSegID = (unsigned long) id;
++
++	SetConfigOption("huge_pages_status", "off",
++					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
++
++	*shim = hdr;
++	return hdr;
++}
++
++/*
++ * Segments belong to the pgzero host, which frees them when their last
++ * process exits, so there is never a stale segment from a previous
++ * postmaster to worry about.
++ */
++bool
++PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
++{
++	return false;
++}
++
++void
++PGSharedMemoryReAttach(void)
++{
++	PGShmemHeader *hdr;
++	int			id = (int) UsedShmemSegID;
++	ssize_t		size;
++
++	Assert(UsedShmemSegAddr != NULL);
++	Assert(IsUnderPostmaster);
++
++	if (UsedShmemSegAddr != (void *) PGZERO_SHM_BASE)
++		elog(FATAL, "unexpected shared memory address %p", UsedShmemSegAddr);
++
++	size = pgzero_shm_size(id);
++	if (size < 0)
++		elog(FATAL, "could not reattach to shared memory (id=%d): %m", id);
++
++	hdr = (PGShmemHeader *) map_segment(id, size);
++	if (hdr->magic != PGShmemMagic)
++		elog(FATAL, "reattached shared memory has bad magic number");
++
++	dsm_set_control_handle(hdr->dsm_control);
++	UsedShmemSegAddr = hdr;
++}
++
++void
++PGSharedMemoryNoReAttach(void)
++{
++	Assert(UsedShmemSegAddr != NULL);
++	Assert(IsUnderPostmaster);
++
++	UsedShmemSegAddr = NULL;
++	UsedShmemSegID = 0;
++}
++
++/*
++ * The mapping stays in place for the life of the process (the host has no
++ * unmap); forgetting it is enough, and a later PGSharedMemoryCreate maps
++ * the new segment over the same window.
++ */
++void
++PGSharedMemoryDetach(void)
++{
++	UsedShmemSegAddr = NULL;
++}
++
++void
++GetHugePageSize(Size *hugepagesize, int *mmap_flags)
++{
++	if (hugepagesize)
++		*hugepagesize = 0;
++	if (mmap_flags)
++		*mmap_flags = 0;
++}
++
++bool
++check_huge_page_size(int *newval, void **extra, GucSource source)
++{
++	if (*newval != 0)
++	{
++		GUC_check_errdetail("\"huge_page_size\" must be 0 on this platform.");
++		return false;
++	}
++	return true;
++}
+diff --git a/src/backend/postmaster/fork_process.c b/src/backend/postmaster/fork_process.c
+index a64eeb7..d09c7c2 100644
+--- a/src/backend/postmaster/fork_process.c
++++ b/src/backend/postmaster/fork_process.c
+@@ -22,7 +22,8 @@
+ #include "miscadmin.h"
+ #include "postmaster/fork_process.h"
+ 
+-#ifndef WIN32
++/* pgzero: wasi has no fork(); launch_backend.c spawns processes directly. */
++#if !defined(WIN32) && !defined(__wasi__)
+ /*
+  * Wrapper for fork(). Return values are the same as those for fork():
+  * -1 if the fork failed, 0 in the child process, and the PID of the
+@@ -125,4 +126,4 @@ fork_process(void)
+ 	return result;
+ }
+ 
+-#endif							/* ! WIN32 */
++#endif							/* ! WIN32 && ! __wasi__ */
+diff --git a/src/backend/postmaster/launch_backend.c b/src/backend/postmaster/launch_backend.c
+index ae94cc9..08a65c4 100644
+--- a/src/backend/postmaster/launch_backend.c
++++ b/src/backend/postmaster/launch_backend.c
+@@ -39,6 +39,9 @@
+ #include "postmaster/bgworker_internals.h"
+ #include "postmaster/bgwriter.h"
+ #include "postmaster/fork_process.h"
++#ifdef __wasi__
++#include "pgzero.h"
++#endif
+ #include "postmaster/pgarch.h"
+ #include "postmaster/postmaster.h"
+ #include "postmaster/startup.h"
+@@ -386,6 +389,15 @@ internal_forkexec(const char *child_kind, int child_slot,
+ 	argv[2] = tmpfilename;
+ 	argv[3] = NULL;
+ 
++#ifdef __wasi__
++	/*
++	 * pgzero: there is no fork(). The host starts a fresh instance of this
++	 * program, which inherits our file descriptors as it would across
++	 * fork+exec.
++	 */
++	fflush(NULL);
++	pid = pgzero_spawn(argv);
++#else
+ 	/* Fire off execv in child */
+ 	if ((pid = fork_process()) == 0)
+ 	{
+@@ -398,6 +410,7 @@ internal_forkexec(const char *child_kind, int child_slot,
+ 			exit(1);
+ 		}
+ 	}
++#endif
+ 
+ 	return pid;					/* Parent returns pid, or -1 on fork failure */
+ }
+@@ -916,7 +929,12 @@ read_backend_variables(char *id, void **startup_data, size_t *startup_data_len)
+ 		exit(1);
+ 	}
+ 
+-	if (fread(&param, sizeof(param), 1, fp) != 1)
++	/*
++	 * Read exactly what save_backend_variables() wrote before the startup
++	 * data: sizeof(param) can be larger, because of trailing padding before
++	 * the flexible array member (e.g. on 32-bit platforms).
++	 */
++	if (fread(&param, SizeOfBackendParameters(0), 1, fp) != 1)
+ 	{
+ 		write_stderr("could not read from backend variables file \"%s\": %m\n", id);
+ 		exit(1);
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index 378c078..bd87ece 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -974,6 +974,19 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
+ 	int			getrlimit_status;
+ #endif
+ 
++#ifdef __wasi__
++
++	/*
++	 * pgzero: descriptors come from two numbering spaces (wasi-libc's files,
++	 * and the host's stdio, pipes and sockets, numbered from 2^20), and
++	 * neither has a per-process limit, so probing with dup() tells us
++	 * nothing. Assume the probe limit is available.
++	 */
++	*usable_fds = max_to_probe;
++	*already_open = 3;
++	return;
++#endif
++
+ 	size = 1024;
+ 	fd = (int *) palloc(size * sizeof(int));
+ 
+diff --git a/src/backend/storage/ipc/dsm_impl.c b/src/backend/storage/ipc/dsm_impl.c
+index 6bf8ab5..a0e3ea4 100644
+--- a/src/backend/storage/ipc/dsm_impl.c
++++ b/src/backend/storage/ipc/dsm_impl.c
+@@ -53,8 +53,10 @@
+ #include <unistd.h>
+ #ifndef WIN32
+ #include <sys/mman.h>
++#ifndef __wasi__
+ #include <sys/ipc.h>
+ #include <sys/shm.h>
++#endif
+ #include <sys/stat.h>
+ #endif
+ 
+diff --git a/src/backend/utils/misc/stack_depth.c b/src/backend/utils/misc/stack_depth.c
+index 2b97673..c517fc9 100644
+--- a/src/backend/utils/misc/stack_depth.c
++++ b/src/backend/utils/misc/stack_depth.c
+@@ -21,6 +21,12 @@
+ #include "miscadmin.h"
+ #include "utils/guc_hooks.h"
+ 
++#ifdef __wasi__
++/* The real functions, behind the pgzero macros in miscadmin.h */
++#undef check_stack_depth
++#undef stack_is_too_deep
++#endif
++
+ 
+ /* GUC variable for maximum stack depth (measured in kilobytes) */
+ int			max_stack_depth = 100;
+@@ -81,6 +87,17 @@ restore_stack_base(pg_stack_base_t base)
+ }
+ 
+ 
++static void
++stack_depth_error(void)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
++			 errmsg("stack depth limit exceeded"),
++			 errhint("Increase the configuration parameter \"max_stack_depth\" (currently %dkB), "
++					 "after ensuring the platform's stack depth limit is adequate.",
++					 max_stack_depth)));
++}
++
+ /*
+  * check_stack_depth/stack_is_too_deep: check for excessively deep recursion
+  *
+@@ -96,14 +113,7 @@ void
+ check_stack_depth(void)
+ {
+ 	if (stack_is_too_deep())
+-	{
+-		ereport(ERROR,
+-				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
+-				 errmsg("stack depth limit exceeded"),
+-				 errhint("Increase the configuration parameter \"max_stack_depth\" (currently %dkB), "
+-						 "after ensuring the platform's stack depth limit is adequate.",
+-						 max_stack_depth)));
+-	}
++		stack_depth_error();
+ }
+ 
+ bool
+@@ -215,3 +225,32 @@ get_stack_depth_rlimit(void)
+ 	return WIN32_STACK_RLIMIT;
+ #endif
+ }
++
++#ifdef __wasi__
++/*
++ * pgzero: check_stack_depth()/stack_is_too_deep() measured from a mark in the
++ * caller's frame; see miscadmin.h.
++ */
++static bool
++stack_is_too_deep_from(const char *address)
++{
++	ssize_t		stack_depth = (ssize_t) (stack_base_ptr - address);
++
++	if (stack_depth < 0)
++		stack_depth = -stack_depth;
++	return stack_depth > max_stack_depth_bytes && stack_base_ptr != NULL;
++}
++
++bool
++pgzero_stack_is_too_deep_at(char *mark)
++{
++	return stack_is_too_deep_from(mark);
++}
++
++void
++pgzero_check_stack_depth_at(char *mark)
++{
++	if (stack_is_too_deep_from(mark))
++		stack_depth_error();
++}
++#endif							/* __wasi__ */
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index 9a7d733..2fe8a9e 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -109,7 +109,13 @@ extern PGDLLIMPORT volatile uint32 CritSectionCount;
+ extern void ProcessInterrupts(void);
+ 
+ /* Test whether an interrupt is pending */
+-#ifndef WIN32
++#if defined(__wasi__)
++/* pgzero: like WIN32, signals are queued and run at safe points such as this */
++#include "pgzero.h"
++#define INTERRUPTS_PENDING_CONDITION() \
++	(pgzero_check_signals(), \
++	 unlikely(InterruptPending))
++#elif !defined(WIN32)
+ #define INTERRUPTS_PENDING_CONDITION() \
+ 	(unlikely(InterruptPending))
+ #else
+@@ -302,6 +308,38 @@ extern pg_stack_base_t set_stack_base(void);
+ extern void restore_stack_base(pg_stack_base_t base);
+ extern void check_stack_depth(void);
+ extern bool stack_is_too_deep(void);
++
++#ifdef __wasi__
++/*
++ * pgzero: in wasm, most of a function's frame lives on the engine's own stack,
++ * which C cannot see; only locals that must be in memory go on the "shadow"
++ * stack that stack_is_too_deep() measures. Recursion through functions that
++ * keep everything in wasm locals (the JSON parser, for one) would then never
++ * register, and deep enough nesting would overflow the engine's stack and
++ * kill the process instead of raising an error.
++ *
++ * So make every guarded call reserve PGZERO_STACK_MARK bytes of shadow stack in
++ * the caller's frame, and measure from there: each level of guarded recursion
++ * then counts at least that much. (Measured: a JSON nesting level uses about
++ * 600 bytes of engine stack, so max_stack_depth still bounds the engine stack
++ * with a wide margin.)
++ */
++#define PGZERO_STACK_MARK 256
++
++extern void pgzero_check_stack_depth_at(char *mark);
++extern bool pgzero_stack_is_too_deep_at(char *mark);
++
++#define check_stack_depth() \
++	do { \
++		char		pgzero_stack_mark_[PGZERO_STACK_MARK]; \
++		pgzero_check_stack_depth_at(pgzero_stack_mark_); \
++	} while (0)
++#define stack_is_too_deep() \
++	({ \
++		char		pgzero_stack_mark_[PGZERO_STACK_MARK]; \
++		pgzero_stack_is_too_deep_at(pgzero_stack_mark_); \
++	})
++#endif
+ extern ssize_t get_stack_depth_rlimit(void);
+ 
+ /* in tcop/utility.c */
+diff --git a/src/include/pg_config_manual.h b/src/include/pg_config_manual.h
+index 125d3eb..fe46b26 100644
+--- a/src/include/pg_config_manual.h
++++ b/src/include/pg_config_manual.h
+@@ -126,6 +126,11 @@
+ #define EXEC_BACKEND
+ #endif
+ 
++/* wasm has no fork() either; the pgzero host starts each process fresh. */
++#ifdef __wasi__
++#define EXEC_BACKEND
++#endif
++
+ /*
+  * USE_POSIX_FADVISE controls whether Postgres will attempt to use the
+  * posix_fadvise() kernel call.  Usually the automatic configure tests are
+diff --git a/src/include/port/wasi.h b/src/include/port/wasi.h
+new file mode 100644
+index 0000000..27c8fd8
+--- /dev/null
++++ b/src/include/port/wasi.h
+@@ -0,0 +1,9 @@
++/* src/include/port/wasi.h */
++
++/*
++ * pgzero: Postgres as a wasm32-wasip2 component. The pgzero host (Go, wazero)
++ * provides processes, shared memory and semaphores; see pgzero's wasm/libpgzero/
++ * directory for the libc extensions this port relies on.
++ */
++
++#define PLATFORM_DEFAULT_WAL_SYNC_METHOD	WAL_SYNC_METHOD_FDATASYNC
+diff --git a/src/include/storage/dsm_impl.h b/src/include/storage/dsm_impl.h
+index 7248cb1..dc39d57 100644
+--- a/src/include/storage/dsm_impl.h
++++ b/src/include/storage/dsm_impl.h
+@@ -26,6 +26,10 @@
+ #ifdef WIN32
+ #define USE_DSM_WINDOWS
+ #define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_WINDOWS
++#elif defined(__wasi__)
++/* pgzero: libpgzero implements POSIX shared memory on host segments. */
++#define USE_DSM_POSIX
++#define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_POSIX
+ #else
+ #ifdef HAVE_SHM_OPEN
+ #define USE_DSM_POSIX
+diff --git a/src/interfaces/libpq/meson.build b/src/interfaces/libpq/meson.build
+index a74e885..013be5b 100644
+--- a/src/interfaces/libpq/meson.build
++++ b/src/interfaces/libpq/meson.build
+@@ -80,8 +80,9 @@ libpq_so = shared_library('libpq',
+   kwargs: default_lib_args,
+ )
+ 
++# pgzero: there are no shared libraries on wasi; programs link libpq statically.
+ libpq = declare_dependency(
+-  link_with: [libpq_so],
++  link_with: [host_system == 'wasi' ? libpq_st : libpq_so],
+   include_directories: [include_directories('.')]
+ )
+ 
+diff --git a/src/makefiles/Makefile.wasi b/src/makefiles/Makefile.wasi
+new file mode 100644
+index 0000000..0271c71
+--- /dev/null
++++ b/src/makefiles/Makefile.wasi
+@@ -0,0 +1,2 @@
++# pgzero: wasm32-wasip2. Loadable modules are linked statically into the
++# server, so there are no shared-library rules here.
+diff --git a/src/port/pg_strong_random.c b/src/port/pg_strong_random.c
+index ea6780d..f410fb3 100644
+--- a/src/port/pg_strong_random.c
++++ b/src/port/pg_strong_random.c
+@@ -134,7 +134,39 @@ pg_strong_random(void *buf, size_t len)
+ 	return false;
+ }
+ 
+-#else							/* not USE_OPENSSL or WIN32 */
++#elif defined(__wasi__)
++
++/*
++ * pgzero: there is no /dev/urandom; getentropy() draws from the host's
++ * cryptographically secure random source (wasi:random).
++ */
++#include <unistd.h>
++
++void
++pg_strong_random_init(void)
++{
++	/* No initialization needed */
++}
++
++bool
++pg_strong_random(void *buf, size_t len)
++{
++	char	   *p = buf;
++
++	/* getentropy() returns at most 256 bytes per call */
++	while (len > 0)
++	{
++		size_t		chunk = Min(len, 256);
++
++		if (getentropy(p, chunk) != 0)
++			return false;
++		p += chunk;
++		len -= chunk;
++	}
++	return true;
++}
++
++#else							/* not USE_OPENSSL, WIN32 or __wasi__ */
+ 
+ /*
+  * Without OpenSSL or Win32 support, just read /dev/urandom ourselves.

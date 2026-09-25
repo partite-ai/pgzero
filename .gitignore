@@ -1,0 +1,6 @@
+.tools/
+.vscode/
+/build/
+*.wasm
+/postgres/
+/pgvector/

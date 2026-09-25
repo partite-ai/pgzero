@@ -1,0 +1,6 @@
+# pgcrypto_lite extension
+comment = 'pgcrypto functions that need no OpenSSL: gen_random_bytes, gen_random_uuid'
+default_version = '1.0'
+module_pathname = '$libdir/pgcrypto_lite'
+relocatable = true
+trusted = true

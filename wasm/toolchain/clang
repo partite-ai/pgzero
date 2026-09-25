@@ -1,0 +1,64 @@
+#!/bin/bash
+# clang for wasm32-wasip2 as driven by meson for the Postgres build.
+#
+# 1. meson treats wasm-ld like ELF lld and wraps libraries in
+#    --start-group/--end-group, which wasm-ld rejects. lld resolves archive
+#    members regardless of order, so the markers are dropped, both from the
+#    command line and from @response files.
+#
+# 2. There is no dynamic linking. Loadable modules (plpgsql, contrib, ...)
+#    are linked statically into the postgres binary afterwards (see
+#    wasm/scripts/link-postgres.sh), and libpgzero's dlopen() finds them in a
+#    generated table. To make that possible:
+#      - objects compiled for a module (<name>.so.p/*.o) get the per-module
+#        entry points (_PG_init, Pg_magic_func, ...) renamed so that
+#        modules don't collide;
+#      - linking a shared module or library just writes a placeholder
+#        file, so that installation works and Postgres finds a file at
+#        $libdir/<name>.so before calling dlopen().
+#    -fPIC is dropped everywhere: everything ends up in one static binary.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+tmp=()
+trap 'rm -f "${tmp[@]}"' EXIT
+
+args=()
+out=""
+shared=0
+compile=0
+prev=""
+for a in "$@"; do
+	case "$a" in
+		-Wl,--start-group|-Wl,--end-group|-fPIC|-fpic) ;;
+		@*)
+			f="${a#@}"
+			if [ -f "$f" ] && grep -q -- '--start-group\|--end-group\|-fPIC' "$f"; then
+				t="$(mktemp)"
+				tmp+=("$t")
+				sed -E 's/(^|[[:space:]])(-Wl,--(start|end)-group|-fPIC)([[:space:]]|$)/\1\4/g' "$f" > "$t"
+				args+=("@$t")
+			else
+				args+=("$a")
+			fi
+			grep -qw -- '-shared' "$f" 2>/dev/null && shared=1
+			;;
+		-shared) shared=1; args+=("$a") ;;
+		-c) compile=1; args+=("$a") ;;
+		*) args+=("$a") ;;
+	esac
+	[ "$prev" = "-o" ] && out="$a"
+	prev="$a"
+done
+
+if [ $shared -eq 1 ] && [ $compile -eq 0 ] && [ -n "$out" ]; then
+	printf 'pgzero: %s is linked statically into postgres\n' "$(basename "$out")" > "$out"
+	exit 0
+fi
+
+if [ $compile -eq 1 ] && [[ "$out" =~ (^|/)([^/]+)\.so\.p/[^/]+\.o$ ]]; then
+	mod="$(printf '%s' "${BASH_REMATCH[2]}" | tr -c 'A-Za-z0-9_\n' '_')"
+	for sym in _PG_init Pg_magic_func _PG_output_plugin_init _PG_archive_module_init; do
+		args+=("-D${sym}=pgzero_mod__${mod}__${sym}")
+	done
+fi
+
+exec "$here/../../.tools/wasi-sdk/bin/clang" --target=wasm32-wasip2 "${args[@]}"
